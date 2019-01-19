@@ -46,6 +46,8 @@ jobs:
     displayName: 'Add Python paths to PATH'
 
   - script: |
+      @echo on
+
       :: Update pip
       python -m pip install --retries 3 -U pip setuptools
 
