@@ -74,7 +74,7 @@ def _upsampled_dft(data, upsampled_region_size,
                          axis_offsets.T))
 
     for i, (n_items, ups_size, ax_offset) in enumerate(dim_properties[::-1]):
-        kernel = (np.arange(ups_size)
+        kernel = (np.arange(ups_size, dtype=np.complex)
                   * np.fft.fftfreq(n_items, upsample_factor)[:, None])
         kernel = np.exp(-im2pi * kernel)
         ax_offset = ax_offset.reshape(*broadcast_shape, 1)
@@ -91,8 +91,8 @@ def _upsampled_dft(data, upsampled_region_size,
             s_fixed *= dim
         data = (data.reshape(s_fixed, data.shape[-1])
                     .dot(kernel)
-                    .reshape(*data.shape[:-1], kernel.shape[-1])
-                    .transpose(range(-1, data.ndim-1)))
+                    .T
+                    .reshape(ups_size, *data.shape[:-1]))
     return_order = tuple(range(nreg, data.ndim)) + tuple(range(nreg))
     return data.transpose(return_order)
 
@@ -187,16 +187,26 @@ def register_translation(src_image, target_image, upsample_factor=1,
                          "register_translation")
 
     image_dim = src_image.ndim
-    image_shape = np.array(src_image.shape)
+    image_shape = src_image.shape
 
     if axes is None:
         axes = image_dim
 
-    register_axes = np.arange(image_dim - axes, image_dim)
-    register_shape = image_shape[register_axes]
-    register_size = np.product(register_shape)
-    broadcast_shape = image_shape[:image_dim - axes]
-    register_axes = tuple(register_axes)
+    register_axes = tuple(range(-axes, 0))
+    register_shape = image_shape[-axes:]
+    broadcast_shape = image_shape[:-axes]
+
+    broadcast_size = 1
+    for dim in broadcast_shape:
+        broadcast_size *= dim
+
+    register_size = 1
+    for dim in register_shape:
+        register_size *= dim
+
+    # Collapse broadcast axes into one dimension
+    src_image = src_image.reshape(broadcast_size, *register_shape)
+    target_iamge = target_image.reshape(broadcast_size, *register_shape)
 
     # assume complex data is already in Fourier space
     if space.lower() == 'fourier':
@@ -204,23 +214,20 @@ def register_translation(src_image, target_image, upsample_factor=1,
         target_freq = target_image
     # real data needs to be fft'd.
     elif space.lower() == 'real':
-        src_freq = np.fft.fftn(src_image, axes=register_axes)
-        target_freq = np.fft.fftn(target_image, axes=register_axes)
+        src_freq = np.fft.fftn(src_image, s=register_shape)
+        target_freq = np.fft.fftn(target_image, s=register_shape)
     else:
         raise ValueError("Error: register_translation only knows the \"real\" "
                          "and \"fourier\" values for the ``space`` argument.")
 
     # Whole-pixel shift - Compute cross-correlation by an IFFT
-    shape = src_freq.shape
     image_product = src_freq * target_freq.conj()
-    cross_correlation = np.fft.ifftn(image_product, axes=register_axes)
-
+    cross_correlation = np.fft.ifftn(image_product, s=register_shape, axes=register_axes)
     # Locate maximum
-    flat_CC = np.abs(cross_correlation).reshape(*broadcast_shape, register_size)
+    flat_CC = np.abs(cross_correlation).reshape(broadcast_size, register_size)
     flat_maxima = np.argmax(flat_CC, axis=-1)
     maxima = np.stack(np.unravel_index(flat_maxima, register_shape), axis=-1)
     midpoints = np.array([np.fix(axis_size / 2) for axis_size in register_shape])
-
     shifts = maxima - np.array(register_shape) * (maxima > midpoints)
     if upsample_factor == 1:
         if return_error:
@@ -228,7 +235,7 @@ def register_translation(src_image, target_image, upsample_factor=1,
                 / register_size
             target_amp = np.sum(np.abs(target_freq) ** 2, axis=register_axes) \
                 / register_size
-            CCmax = flat_CC[..., flat_maxima]
+            CCmax = cross_correlation[(np.arange(broadcast_size), *maxima.T)]
     # If upsampling > 1, then refine estimate with matrix multiply DFT
     else:
         # Initial shift estimate in upsampled grid
@@ -240,37 +247,46 @@ def register_translation(src_image, target_image, upsample_factor=1,
         normalization = (src_freq.size * upsample_factor ** 2)
         # Matrix multiply DFT around the current shift estimate
         sample_region_offset = dftshift - shifts*upsample_factor
+        image_product = image_product.reshape(*broadcast_shape, *register_shape)
         cross_correlation = _upsampled_dft(image_product.conj(),
                                            upsampled_region_size,
                                            upsample_factor,
                                            sample_region_offset,
                                            axes=register_axes).conj()
+        cross_correlation = cross_correlation.reshape(broadcast_size, 
+                                                      *((upsampled_region_size,)
+                                                         * axes))
         cross_correlation /= normalization
         # Locate maximum and map back to original pixel grid
-        flat_CC = np.abs(cross_correlation).reshape(*broadcast_shape,
+        flat_CC = np.abs(cross_correlation).reshape(broadcast_size,
                                                     upsampled_region_size
-                                                    ** len(register_axes))
+                                                    ** axes)
         flat_maxima = np.argmax(flat_CC, axis=-1)
-        CCmax = flat_CC[..., flat_maxima]
         maxima = np.stack(np.unravel_index(flat_maxima,
                                            (upsampled_region_size,) * axes),
                           axis=-1)
+        CCmax = cross_correlation[(np.arange(broadcast_size), *maxima.T)]
 
         shifts = shifts + (maxima - dftshift) / upsample_factor
 
         if return_error:
+            src_freq = src_freq.reshape(*broadcast_shape, *register_shape)
             src_amp = _upsampled_dft(src_freq * src_freq.conj(),
                                      1, upsample_factor, axes=register_axes)
             src_amp /= normalization
+            target_freq = target_freq.reshape(*broadcast_shape, *register_shape)
             target_amp = _upsampled_dft(target_freq * target_freq.conj(),
                                         1, upsample_factor, axes=register_axes)
             target_amp /= normalization
 
     # If its only one row or column the shift along that dimension has no
     # effect. We set to zero.
-    for dim in register_axes:
-        if shape[dim] == 1:
-            shifts[dim] = 0
+
+    for i, dim in enumerate(register_shape):
+        if dim == 1:
+            shifts[:, i] = 0
+
+    shifts = shifts.reshape(*broadcast_shape, axes)
 
     if return_error:
         return shifts, _compute_error(CCmax, src_amp, target_amp),\
